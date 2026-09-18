@@ -243,72 +243,63 @@ type PromptTokensDetails record {
 
 // ── Wire → normalized mapping ──────────────────────────────────────────────
 // Projects an OpenRouter `chat.completion.chunk` (the wire types above) onto the
-// normalized `ai:ChatCompletionChunk` that `chatStream` must return. Only the
+// normalized `ai:ChatMessageChunk` that `chatAsStream` must return. Only the
 // subset the `ai` type can hold is mapped; everything else is ignored.
 
-# Maps an OpenRouter wire chunk onto the normalized `ai:ChatCompletionChunk`.
-# Forwards tool calls on every chunk (not just the first), so argument fragments
-# stream through correctly.
+# Maps an OpenRouter wire chunk onto the normalized `ai:ChatMessageChunk`. Forwards tool
+# calls on every chunk (not just the first), so argument fragments stream through
+# correctly. `role` is set unconditionally, per the `ai:ChatMessageChunk` contract.
 #
 # + w - The parsed OpenRouter wire chunk
-# + return - The normalized chunk consumed by the `ai` module
-isolated function toAiChunk(CreateChatCompletionStreamResponse w) returns ai:ChatCompletionChunk {
-    ai:ChatCompletionChunkChoice[] choices = [];
-    foreach ChatCompletionStreamChoice c in w.choices {
-        ai:ChatCompletionChunkDelta delta = {content: c.delta.content};
-        ai:ROLE? role = mapRole(c.delta?.role);
-        if role is ai:ROLE {
-            delta.role = role;
-        }
-        string? reasoning = c.delta?.reasoning;
-        if reasoning is string {
-            delta.reasoning = reasoning;
-        }
-        ChatCompletionMessageToolCallChunk[]? wireToolCalls = c.delta?.tool_calls;
-        if wireToolCalls is ChatCompletionMessageToolCallChunk[] {
-            ai:ToolCallChunk[] toolCalls = [];
-            foreach ChatCompletionMessageToolCallChunk t in wireToolCalls {
-                ai:ToolCallChunk toolCall = {index: t.index};
-                string? id = t?.id;
-                if id is string {
-                    toolCall.id = id;
-                }
-                ChatCompletionMessageToolCallChunkFunction? fn = t?.'function;
-                if fn is ChatCompletionMessageToolCallChunkFunction {
-                    ai:FunctionCallChunk functionFragment = {};
-                    string? name = fn?.name;
-                    if name is string {
-                        functionFragment.name = name;
-                    }
-                    string? arguments = fn?.arguments;
-                    if arguments is string {
-                        functionFragment.arguments = arguments;
-                    }
-                    toolCall.'function = functionFragment;
-                }
-                toolCalls.push(toolCall);
+# + return - The normalized chunk, or `()` when the event carries nothing for the caller
+# (no choices - e.g. a usage-only final chunk - or an opening delta with no content,
+# reasoning, tool calls or finish reason)
+isolated function toAiChatMessageChunk(CreateChatCompletionStreamResponse w) returns ai:ChatMessageChunk? {
+    ChatCompletionStreamChoice[] choices = w.choices;
+    if choices.length() == 0 {
+        return ();
+    }
+    ChatCompletionStreamChoice choice = choices[0];
+    ChatCompletionStreamResponseDelta delta = choice.delta;
+
+    string? content = delta.content is string && delta.content != "" ? delta.content : ();
+    string? reasoning = delta.reasoning is string && delta.reasoning != "" ? delta.reasoning : ();
+
+    ai:ToolCallChunk[]? toolCalls = ();
+    ChatCompletionMessageToolCallChunk[]? wireToolCalls = delta.tool_calls;
+    if wireToolCalls is ChatCompletionMessageToolCallChunk[] && wireToolCalls.length() > 0 {
+        ai:ToolCallChunk[] mapped = [];
+        foreach ChatCompletionMessageToolCallChunk t in wireToolCalls {
+            ai:ToolCallChunk toolCall = {index: t.index};
+            string? id = t?.id;
+            if id is string {
+                toolCall.id = id;
             }
-            delta.toolCalls = toolCalls;
+            ChatCompletionMessageToolCallChunkFunction? fn = t?.'function;
+            if fn is ChatCompletionMessageToolCallChunkFunction {
+                string? name = fn?.name;
+                if name is string {
+                    toolCall.name = name;
+                }
+                string? arguments = fn?.arguments;
+                if arguments is string {
+                    toolCall.arguments = arguments;
+                }
+            }
+            mapped.push(toolCall);
         }
-        choices.push({index: c.index, delta, finishReason: mapFinishReason(c.finish_reason)});
+        toolCalls = mapped;
     }
 
-    ai:ChatCompletionChunk chunk = {choices};
+    ai:FinishReason? finishReason = mapFinishReason(choice.finish_reason);
+    if content is () && reasoning is () && toolCalls is () && finishReason is () {
+        return ();
+    }
+
+    ai:ChatMessageChunk chunk = {role: ai:ASSISTANT, content, reasoning, toolCalls, finishReason};
     string? id = w?.id;
     if id is string {
         chunk.id = id;
-    }
-    string? model = w?.model;
-    if model is string {
-        chunk.model = model;
-    }
-    CompletionUsage? usage = w.usage;
-    if usage is CompletionUsage {
-        chunk.usage = {
-            promptTokens: usage.prompt_tokens,
-            completionTokens: usage.completion_tokens,
-            totalTokens: usage.total_tokens
-        };
     }
     return chunk;
 }
@@ -334,30 +325,6 @@ isolated function extractStreamErrorFrame(json payload) returns string? {
         }
     }
     return failure.toJsonString();
-}
-
-# Safely maps an OpenRouter role string onto the `ai:ROLE` enum; returns `()` for
-# absent or unrecognized values rather than panicking on a cast.
-#
-# + role - The role string from the wire delta
-# + return - The mapped `ai:ROLE`, or `()` when absent/unrecognized
-isolated function mapRole(string? role) returns ai:ROLE? {
-    // Streamed response deltas only carry the "assistant" role; "system"/"user" are
-    // handled for completeness. `ai:FUNCTION` is deliberately omitted: the "function"
-    // role is request-only and never appears in a response delta, so treating it as
-    // unrecognized is correct rather than a gap.
-    match role {
-        "system" => {
-            return ai:SYSTEM;
-        }
-        "user" => {
-            return ai:USER;
-        }
-        "assistant" => {
-            return ai:ASSISTANT;
-        }
-    }
-    return ();
 }
 
 # Safely maps an OpenRouter finish reason onto the `ai:FinishReason` enum. The

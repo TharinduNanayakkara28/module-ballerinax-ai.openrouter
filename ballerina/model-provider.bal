@@ -23,6 +23,16 @@ import ballerinax/openrouter;
 const DEFAULT_OPENROUTER_SERVICE_URL = "https://openrouter.ai/api/v1";
 const DEFAULT_MAX_TOKEN_COUNT = 512;
 
+# Closes the concrete span (a `ChatSpan` for `chatAsStream`, a `GenerateContentSpan` for
+# `generateAsStream`) backing a streaming request.
+#
+# `observe:LlmSpan.close` is inherited from `observe:AiSpan` through a second level of
+# `*`-inclusion, and does not resolve when called through the abstract `observe:LlmSpan`
+# type from outside the `ai` module - every other `observe:LlmSpan` member does. Capturing
+# `close` as a closure at the call site, where the span is still concretely typed, works
+# around that and lets `openChunkStream`/`OpenRouterChunkIterator` stay span-type-agnostic.
+type SpanCloser isolated function (error? err) returns ();
+
 # ModelProvider is a client class that provides an interface for interacting with
 # LLMs via the OpenRouter unified API, which supports models from OpenAI, Anthropic,
 # Google, Meta, Mistral, and many other providers.
@@ -189,11 +199,11 @@ public isolated distinct client class ModelProvider {
     # + messages - List of chat messages or a single user message
     # + tools - Tool definitions to be used for the tool call
     # + stop - Stop sequence to stop the completion
-    # + return - A stream of chat completion chunks, or an error in case of failures
-    isolated remote function chatStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
+    # + return - A stream of chat message chunks, or an error in case of failures
+    isolated remote function chatAsStream(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools = [], string? stop = ())
-            returns stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error {
-        observe:ChatSpan span = observe:createChatSpan(self.modelType);
+            returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
+        final observe:ChatSpan span = observe:createChatSpan(self.modelType);
         span.addProvider("openrouter");
         if stop is string {
             span.addStopSequence(stop);
@@ -232,6 +242,63 @@ public isolated distinct client class ModelProvider {
             span.addTools(tools);
         }
 
+        return self.openChunkStream(request, span, isolated function(error? err) {
+            span.close(err);
+        });
+    }
+
+    # Sends a streaming chat request to the model using the given prompt and streams back the
+    # generated answer as text fragments. The request is built from the prompt the same way as
+    # for `generate` (text and image content parts), without the structured-output tool.
+    #
+    # Streaming produces text only: structured types have no valid intermediate state, so use
+    # `generate` for structured output.
+    #
+    # + prompt - The prompt to use in the chat request
+    # + return - A stream of text fragments, or an error if generation fails
+    isolated remote function generateAsStream(ai:Prompt prompt) returns stream<string, ai:Error?>|ai:Error {
+        final observe:GenerateContentSpan span = observe:createGenerateContentSpan(self.modelType);
+        span.addProvider("openrouter");
+        decimal? temperature = self.temperature;
+        if temperature is decimal {
+            span.addTemperature(temperature);
+        }
+
+        DocumentContentPart[]|ai:Error content = generateChatCreationContent(prompt);
+        if content is ai:Error {
+            span.close(content);
+            return content;
+        }
+
+        openrouter:ChatGenerationParams request = {
+            max_completion_tokens: <decimal>self.maxTokens,
+            model: self.modelType,
+            messages: [<openrouter:UserMessage>{role: "user", content}],
+            'stream: true
+        };
+        if temperature is decimal {
+            request.temperature = temperature;
+        }
+        span.addInputMessages(request.messages.toJson());
+
+        stream<ai:ChatMessageChunk, ai:Error?>|ai:Error chunks = self.openChunkStream(request, span,
+                isolated function(error? err) {
+            span.close(err);
+        });
+        if chunks is ai:Error {
+            return chunks;
+        }
+        // Assigning to an explicitly typed local first; `new (...)` cannot infer
+        // the stream type when the function returns a union (`stream<...>|Error`).
+        stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
+        return textStream;
+    }
+
+    // Opens the SSE stream for `request` and wraps it as a normalized chunk stream. The span
+    // is closed here if the connection fails, and by the returned stream's iterator otherwise.
+    // `closeSpan` closes `span`; see `SpanCloser` for why it is threaded through separately.
+    private isolated function openChunkStream(openrouter:ChatGenerationParams request, observe:LlmSpan span,
+            SpanCloser closeSpan) returns stream<ai:ChatMessageChunk, ai:Error?>|ai:Error {
         // The OpenRouter connector deserializes the full response, so streaming
         // uses the raw `streamClient`; copy through the attribution headers.
         map<string|string[]> headers = {};
@@ -246,25 +313,15 @@ public isolated distinct client class ModelProvider {
         stream<http:SseEvent, error?>|ai:Error sseStream =
             openSseStream(self.streamClient, "/chat/completions", request, headers);
         if sseStream is ai:Error {
-            span.close(sseStream);
+            closeSpan(sseStream);
             return sseStream;
         }
         // Assigning to an explicitly typed local first; `new (...)` cannot infer
         // the stream type when the function returns a union (`stream<...>|Error`).
-        stream<ai:ChatCompletionChunk, ai:Error?> chunkStream = new (new OpenRouterChunkIterator(sseStream, span));
+        stream<ai:ChatMessageChunk, ai:Error?> chunkStream =
+            new (new OpenRouterChunkIterator(sseStream, span, closeSpan));
         return chunkStream;
     }
-
-    # Sends a streaming chat request to the model using the given prompt and streams
-    # back the generated answer. Only `string` is supported as the expected type.
-    #
-    # + prompt - The prompt to use in the chat request
-    # + td - The expected type of the streamed value; must be `string`
-    # + return - A stream of the generated value, or an error if the type is unsupported
-    remote function generateStream(ai:Prompt prompt, @display {label: "Expected type"} typedesc<anydata> td = <>)
-            returns stream<td, ai:Error?>|ai:Error = @java:Method {
-        'class: "io.ballerina.lib.ai.openrouter.StreamGenerator"
-    } external;
 
     private isolated function prepareCompletionRequestMessages(ai:ChatMessage[]|ai:ChatUserMessage messages,
             ai:ChatCompletionFunctions[] tools) returns openrouter:Message[]|ai:Error {
@@ -427,10 +484,12 @@ isolated function extractHttpErrorDetail(http:Response response) returns string?
 }
 
 # Iterator that converts OpenRouter's Server-Sent Event stream into a stream of
-# normalized `ai:ChatCompletionChunk` values. Each `data:` line is parsed into the
-# OpenRouter wire chunk and mapped via `toAiChunk`; the terminating `[DONE]` sentinel ends
-# the stream, and blank lines and keep-alive comments are skipped. The chat span is closed
-# once the stream is done, whether it ended cleanly, failed, or was closed by the caller.
+# normalized `ai:ChatMessageChunk` values. Each `data:` line is parsed into the OpenRouter
+# wire chunk and mapped via `toAiChatMessageChunk`; the terminating `[DONE]` sentinel ends
+# the stream, and blank lines, keep-alive comments, and events that carry nothing for the
+# caller (usage-only chunks, a role-only opening delta) are skipped. The span - a `ChatSpan`
+# for `chatAsStream` or a `GenerateContentSpan` for `generateAsStream` - is closed once the
+# stream is done, whether it ended cleanly, failed, or was closed by the caller.
 #
 # A frame that cannot be parsed is reported as an error rather than skipped: OpenRouter
 # emits `{"error": {...}}` mid-stream when a generation is cut short, and skipping it would
@@ -438,19 +497,18 @@ isolated function extractHttpErrorDetail(http:Response response) returns string?
 # if every frame is unparseable, an empty answer that looks successful.
 class OpenRouterChunkIterator {
     private stream<http:SseEvent, error?> sseStream;
-    private observe:ChatSpan span;
+    private observe:LlmSpan span;
+    private SpanCloser closeSpan;
     private boolean done = false;
 
-    isolated function init(stream<http:SseEvent, error?> sseStream, observe:ChatSpan span) {
+    isolated function init(stream<http:SseEvent, error?> sseStream, observe:LlmSpan span, SpanCloser closeSpan) {
         self.sseStream = sseStream;
         self.span = span;
+        self.closeSpan = closeSpan;
     }
 
-    public isolated function next() returns record {|ai:ChatCompletionChunk value;|}|ai:Error? {
-        if self.isDone() {
-            return ();
-        }
-        while true {
+    public isolated function next() returns record {|ai:ChatMessageChunk value;|}|ai:Error? {
+        while !self.isDone() {
             record {|http:SseEvent value;|}|error? event = self.sseStream.next();
             if event is () {
                 return self.finish();
@@ -484,15 +542,18 @@ class OpenRouterChunkIterator {
                 return self.failStream(error ai:LlmInvalidResponseError(
                         "Unexpected chunk shape received from the model", wireChunk));
             }
-            ai:ChatCompletionChunk chunk = toAiChunk(wireChunk);
-            self.recordChunk(chunk);
-            return {value: chunk};
+            self.recordObservations(wireChunk);
+            ai:ChatMessageChunk? chunk = toAiChatMessageChunk(wireChunk);
+            if chunk is ai:ChatMessageChunk {
+                return {value: chunk};
+            }
         }
+        return ();
     }
 
     public isolated function close() returns ai:Error? {
         if !self.markDone() {
-            self.span.close();
+            self.closeSpan(());
         }
         error? result = self.sseStream.close();
         if result is error {
@@ -501,26 +562,24 @@ class OpenRouterChunkIterator {
         return ();
     }
 
-    // Records the finish reason and usage the span reports for the completed generation.
-    // OpenRouter always sends full usage details on the final chunk.
-    private isolated function recordChunk(ai:ChatCompletionChunk chunk) {
-        ai:ChatCompletionChunkChoice[] choices = chunk.choices;
+    // Reports the response id, token usage and raw finish reason carried by `wireChunk` to
+    // the span. OpenRouter always sends full usage details on the final chunk.
+    private isolated function recordObservations(CreateChatCompletionStreamResponse wireChunk) {
+        string? id = wireChunk.id;
+        if id is string {
+            self.span.addResponseId(id);
+        }
+        CompletionUsage? usage = wireChunk.usage;
+        if usage is CompletionUsage {
+            self.span.addInputTokenCount(usage.prompt_tokens);
+            self.span.addOutputTokenCount(usage.completion_tokens);
+        }
+        ChatCompletionStreamChoice[] choices = wireChunk.choices;
         if choices.length() > 0 {
-            ai:FinishReason? finishReason = choices[0].finishReason;
-            if finishReason is ai:FinishReason {
+            string? finishReason = choices[0].finish_reason;
+            if finishReason is string {
                 self.span.addFinishReason(finishReason);
                 self.span.addOutputType(observe:TEXT);
-            }
-        }
-        ai:CompletionTokenUsage? usage = chunk?.usage;
-        if usage is ai:CompletionTokenUsage {
-            int? promptTokens = usage?.promptTokens;
-            if promptTokens is int {
-                self.span.addInputTokenCount(promptTokens);
-            }
-            int? completionTokens = usage?.completionTokens;
-            if completionTokens is int {
-                self.span.addOutputTokenCount(completionTokens);
             }
         }
     }
@@ -528,7 +587,7 @@ class OpenRouterChunkIterator {
     // Ends the stream cleanly, closing the span exactly once.
     private isolated function finish() returns () {
         if !self.markDone() {
-            self.span.close();
+            self.closeSpan(());
         }
         return ();
     }
@@ -536,7 +595,7 @@ class OpenRouterChunkIterator {
     // Ends the stream with an error, closing the span exactly once.
     private isolated function failStream(ai:Error err) returns ai:Error {
         if !self.markDone() {
-            self.span.close(err);
+            self.closeSpan(err);
         }
         return err;
     }
@@ -557,58 +616,33 @@ class OpenRouterChunkIterator {
     }
 }
 
-# Builds the string stream behind the dependently-typed `generateStream`. The
-# native `StreamGenerator` shim trampolines here so the type gating stays in
-# Ballerina. Only `string` is supported; other types yield an error because a
-# partial generation is a valid value only for `string`. When valid, the
-# underlying `chatStream` chunks are projected onto their text fragments.
-#
-# + llmModel - The model provider whose `chatStream` supplies the chunks
-# + prompt - The prompt to send to the model
-# + td - The caller's expected type; must be `string`
-# + return - A stream of text fragments, or an error if the type is unsupported
-function generateLlmResponseStream(ModelProvider llmModel, ai:Prompt prompt, typedesc<anydata> td)
-        returns stream<string, ai:Error?>|ai:Error {
-    if td !is typedesc<string> {
-        return error ai:Error("This data type is not supported for streaming. " +
-            "'generateStream' supports only 'string'; use 'generate' for structured types.");
-    }
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks = check llmModel->chatStream({role: ai:USER, content: prompt});
-    stream<string, ai:Error?> textStream = new (new ChunkTextIterator(chunks));
-    return textStream;
-}
-
-# Projects a normalized `ai:ChatCompletionChunk` stream onto its text content,
-# yielding each non-empty `delta.content` fragment and skipping tool-call and
-# usage-only chunks. Backs `generateLlmResponseStream`.
+# Projects a normalized `ai:ChatMessageChunk` stream onto its answer text, yielding each
+# non-empty `content` fragment and skipping tool-call, reasoning and finish-only chunks.
+# Backs `generateAsStream`; closing it closes the underlying chunk stream.
 class ChunkTextIterator {
-    private stream<ai:ChatCompletionChunk, ai:Error?> chunks;
+    private stream<ai:ChatMessageChunk, ai:Error?> chunks;
 
-    isolated function init(stream<ai:ChatCompletionChunk, ai:Error?> chunks) {
+    isolated function init(stream<ai:ChatMessageChunk, ai:Error?> chunks) {
         self.chunks = chunks;
     }
 
     public isolated function next() returns record {|string value;|}|ai:Error? {
         while true {
-            record {|ai:ChatCompletionChunk value;|}|ai:Error? next = self.chunks.next();
+            record {|ai:ChatMessageChunk value;|}|ai:Error? next = self.chunks.next();
             if next is () {
                 return ();
             }
             if next is ai:Error {
                 return next;
             }
-            ai:ChatCompletionChunkChoice[] choices = next.value.choices;
-            if choices.length() == 0 {
-                continue;
-            }
-            string? content = choices[0].delta.content;
+            string? content = next.value.content;
             if content is string && content.length() > 0 {
                 return {value: content};
             }
         }
     }
 
-    // `chunks` is the `chatStream` stream, whose `close` already returns an `ai:Error`
+    // `chunks` is the `chatAsStream` stream, whose `close` already returns an `ai:Error`
     // carrying the real failure; re-wrapping it would only bury that message a level down.
     public isolated function close() returns ai:Error? {
         return self.chunks.close();

@@ -10,9 +10,9 @@ version = "1.0.1"
 icon="icon.png"
 
 # TODO: Remove this block before merging.
-# The streaming API (`ai:ChatCompletionChunk`, `ModelProvider.chatStream`) is not in any
-# published `ballerina/ai` release yet - as of `ai` 1.14.1 on Central it exists only in a
-# local build of the `feat/add-chat-stream-support` branch of module-ballerina-ai. Once
+# The streaming API (`ai:ChatMessageChunk`, `ModelProvider.chatAsStream`/`generateAsStream`) is
+# not in any published `ballerina/ai` release yet - as of `ai` 1.14.1 on Central it exists only
+# in a local build of the `feat/add-chat-stream-support` branch of module-ballerina-ai. Once
 # that lands and is released, drop this block and let `ai` resolve from Central.
 #
 # Two caveats while it is here:

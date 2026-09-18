@@ -24,71 +24,71 @@ isolated function streamingProvider(string scenario) returns ModelProvider|ai:Er
 
 // Collects the text of a chunk stream, so a test asserts on the assembled answer rather
 // than on chunk bookkeeping.
-isolated function collectContent(stream<ai:ChatCompletionChunk, ai:Error?> chunks) returns string|ai:Error {
+isolated function collectContent(stream<ai:ChatMessageChunk, ai:Error?> chunks) returns string|ai:Error {
     string content = "";
     while true {
-        record {|ai:ChatCompletionChunk value;|}|ai:Error? next = chunks.next();
+        record {|ai:ChatMessageChunk value;|}|ai:Error? next = chunks.next();
         if next is () {
             return content;
         }
         if next is ai:Error {
             return next;
         }
-        foreach ai:ChatCompletionChunkChoice choice in next.value.choices {
-            content += choice.delta.content ?: "";
-        }
+        content += next.value.content ?: "";
     }
 }
 
 @test:Config
-function testChatStreamAssemblesTextAndUsage() returns error? {
+function testChatStreamAssemblesText() returns error? {
     ModelProvider provider = check streamingProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
 
     string content = "";
     ai:FinishReason? finishReason = ();
-    ai:CompletionTokenUsage? usage = ();
     int chunkCount = 0;
 
-    check from ai:ChatCompletionChunk chunk in chunks
+    check from ai:ChatMessageChunk chunk in chunks
         do {
             chunkCount += 1;
-            foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-                content += choice.delta.content ?: "";
-                ai:FinishReason? reason = choice.finishReason;
-                if reason is ai:FinishReason {
-                    finishReason = reason;
-                }
-            }
-            ai:CompletionTokenUsage? chunkUsage = chunk?.usage;
-            if chunkUsage is ai:CompletionTokenUsage {
-                usage = chunkUsage;
+            content += chunk.content ?: "";
+            ai:FinishReason? reason = chunk.finishReason;
+            if reason is ai:FinishReason {
+                finishReason = reason;
             }
         };
 
     test:assertEquals(content, "Hello world");
     test:assertEquals(finishReason, ai:STOP);
-    test:assertEquals(chunkCount, 4, "The [DONE] sentinel must not surface as a chunk");
-    test:assertEquals(usage, <ai:CompletionTokenUsage>{
-        promptTokens: 10,
-        completionTokens: 5,
-        totalTokens: 15
-    });
+    test:assertEquals(chunkCount, 3, "The [DONE] sentinel and the usage-only chunk must not surface as chunks");
 }
 
 @test:Config
-function testChatStreamCarriesIdAndModel() returns error? {
+function testChatStreamSetsRoleOnEveryChunk() returns error? {
     ModelProvider provider = check streamingProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
-    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
-    if first !is record {|ai:ChatCompletionChunk value;|} {
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
+
+    int chunkCount = 0;
+    check from ai:ChatMessageChunk chunk in chunks
+        do {
+            chunkCount += 1;
+            test:assertEquals(chunk.role, ai:ASSISTANT, "role must be set on every chunk");
+        };
+    test:assertTrue(chunkCount > 1, "This scenario must stream more than one chunk");
+}
+
+@test:Config
+function testChatStreamCarriesId() returns error? {
+    ModelProvider provider = check streamingProvider("text");
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
+    record {|ai:ChatMessageChunk value;|}|ai:Error? first = chunks.next();
+    if first !is record {|ai:ChatMessageChunk value;|} {
         test:assertFail("Expected a first chunk");
     }
     test:assertEquals(first.value?.id, "gen-1");
-    test:assertEquals(first.value?.model, "openai/gpt-5");
-    test:assertEquals(first.value.choices[0].delta.role, ai:ASSISTANT);
+    test:assertEquals(first.value.role, ai:ASSISTANT);
     check chunks.close();
 }
 
@@ -97,48 +97,42 @@ function testChatStreamCarriesIdAndModel() returns error? {
 @test:Config
 function testChatStreamAcceptsMinimalEnvelope() returns error? {
     ModelProvider provider = check streamingProvider("minimal");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
     test:assertEquals(check collectContent(chunks), "Lean envelope");
 }
 
 @test:Config
 function testChatStreamAccumulatesToolCallFragments() returns error? {
     ModelProvider provider = check streamingProvider("tools");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
 
     map<string> names = {};
     map<string> arguments = {};
     map<string> ids = {};
     ai:FinishReason? finishReason = ();
 
-    check from ai:ChatCompletionChunk chunk in chunks
+    check from ai:ChatMessageChunk chunk in chunks
         do {
-            foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-                ai:FinishReason? reason = choice.finishReason;
-                if reason is ai:FinishReason {
-                    finishReason = reason;
-                }
-                ai:ToolCallChunk[]? toolCalls = choice.delta.toolCalls;
-                if toolCalls is () {
-                    continue;
-                }
+            test:assertEquals(chunk.role, ai:ASSISTANT, "role must be set on every chunk");
+            ai:FinishReason? reason = chunk.finishReason;
+            if reason is ai:FinishReason {
+                finishReason = reason;
+            }
+            ai:ToolCallChunk[]? toolCalls = chunk.toolCalls;
+            if toolCalls is ai:ToolCallChunk[] {
                 foreach ai:ToolCallChunk toolCall in toolCalls {
                     string key = toolCall.index.toString();
                     string? id = toolCall?.id;
                     if id is string {
                         ids[key] = id;
                     }
-                    ai:FunctionCallChunk? 'function = toolCall?.'function;
-                    if 'function is () {
-                        continue;
-                    }
-                    string? name = 'function?.name;
+                    string? name = toolCall?.name;
                     if name is string {
                         names[key] = name;
                     }
-                    arguments[key] = (arguments[key] ?: "") + ('function?.arguments ?: "");
+                    arguments[key] = (arguments[key] ?: "") + (toolCall?.arguments ?: "");
                 }
             }
         };
@@ -153,17 +147,15 @@ function testChatStreamAccumulatesToolCallFragments() returns error? {
 @test:Config
 function testChatStreamExposesReasoning() returns error? {
     ModelProvider provider = check streamingProvider("reasoning");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "What is 6 times 7?"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "What is 6 times 7?"});
 
     string reasoning = "";
     string content = "";
-    check from ai:ChatCompletionChunk chunk in chunks
+    check from ai:ChatMessageChunk chunk in chunks
         do {
-            foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-                reasoning += choice.delta.reasoning ?: "";
-                content += choice.delta.content ?: "";
-            }
+            reasoning += chunk.reasoning ?: "";
+            content += chunk.content ?: "";
         };
 
     test:assertEquals(reasoning, "Let me think about it");
@@ -171,20 +163,20 @@ function testChatStreamExposesReasoning() returns error? {
 }
 
 // OpenRouter normalizes upstream failures to a finish reason of "error", which is outside
-// the `ai:FinishReason` set; it must map to `()` rather than failing the stream.
+// the `ai:FinishReason` set; it must map to `()` rather than failing the stream. A chunk
+// whose only content is that unrecognized reason carries nothing mappable at all, so it is
+// skipped entirely rather than surfacing as an empty chunk.
 @test:Config
 function testChatStreamMapsUnknownFinishReasonToNil() returns error? {
     ModelProvider provider = check streamingProvider("unknownfinish");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
 
     string content = "";
-    check from ai:ChatCompletionChunk chunk in chunks
+    check from ai:ChatMessageChunk chunk in chunks
         do {
-            foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-                content += choice.delta.content ?: "";
-                test:assertEquals(choice.finishReason, (), "An unrecognized finish reason must map to ()");
-            }
+            content += chunk.content ?: "";
+            test:assertEquals(chunk.finishReason, (), "An unrecognized finish reason must map to ()");
         };
     test:assertEquals(content, "Partial");
 }
@@ -192,8 +184,8 @@ function testChatStreamMapsUnknownFinishReasonToNil() returns error? {
 @test:Config
 function testChatStreamSkipsKeepAliveFrames() returns error? {
     ModelProvider provider = check streamingProvider("keepalive");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
     test:assertEquals(check collectContent(chunks), "After keep-alive");
 }
 
@@ -202,8 +194,8 @@ function testChatStreamSkipsKeepAliveFrames() returns error? {
 @test:Config
 function testChatStreamSurfacesMidStreamError() returns error? {
     ModelProvider provider = check streamingProvider("midstreamerror");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
 
     string|ai:Error content = collectContent(chunks);
     if content !is ai:Error {
@@ -216,8 +208,8 @@ function testChatStreamSurfacesMidStreamError() returns error? {
 @test:Config
 function testChatStreamSurfacesMalformedFrame() returns error? {
     ModelProvider provider = check streamingProvider("malformed");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
 
     string|ai:Error content = collectContent(chunks);
     if content !is ai:Error {
@@ -232,11 +224,12 @@ function testChatStreamSurfacesMalformedFrame() returns error? {
 @test:Config
 function testChatStreamReportsUnauthorized() returns error? {
     ModelProvider provider = check streamingProvider("unauthorized");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error chunks =
-        provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error chunks =
+        provider->chatAsStream({role: ai:USER, content: "hi"});
     if chunks !is ai:Error {
         test:assertFail("Expected a 401 to fail the request");
     }
+    test:assertTrue(chunks is ai:LlmConnectionError, "A connection failure must surface as an ai:LlmConnectionError");
     test:assertTrue(chunks.message().includes("401"), chunks.message());
     test:assertTrue(chunks.message().includes("No auth credentials found"), chunks.message());
 }
@@ -244,8 +237,8 @@ function testChatStreamReportsUnauthorized() returns error? {
 @test:Config
 function testChatStreamReportsInsufficientCredits() returns error? {
     ModelProvider provider = check streamingProvider("insufficientcredits");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error chunks =
-        provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error chunks =
+        provider->chatAsStream({role: ai:USER, content: "hi"});
     if chunks !is ai:Error {
         test:assertFail("Expected a 402 to fail the request");
     }
@@ -255,8 +248,8 @@ function testChatStreamReportsInsufficientCredits() returns error? {
 @test:Config
 function testChatStreamReportsPlainTextErrorBody() returns error? {
     ModelProvider provider = check streamingProvider("plaintexterror");
-    stream<ai:ChatCompletionChunk, ai:Error?>|ai:Error chunks =
-        provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?>|ai:Error chunks =
+        provider->chatAsStream({role: ai:USER, content: "hi"});
     if chunks !is ai:Error {
         test:assertFail("Expected a 502 to fail the request");
     }
@@ -267,15 +260,15 @@ function testChatStreamReportsPlainTextErrorBody() returns error? {
 function testChatStreamSendsAttributionHeaders() returns error? {
     ModelProvider provider = check new (API_KEY, "openai/gpt-5", string `${SSE_BASE_URL}/attribution`,
             siteUrl = "https://example.com", siteName = "Example App");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
     _ = check collectContent(chunks);
 }
 
 @test:Config
-function testGenerateStreamYieldsTextFragments() returns error? {
+function testGenerateAsStreamYieldsTextFragments() returns error? {
     ModelProvider provider = check streamingProvider("text");
-    stream<string, ai:Error?> fragments = check provider->generateStream(`Say hello`);
+    stream<string, ai:Error?> fragments = check provider->generateAsStream(`Say hello`);
 
     string[] collected = [];
     check from string fragment in fragments
@@ -288,24 +281,14 @@ function testGenerateStreamYieldsTextFragments() returns error? {
     test:assertEquals(collected, ["Hello", " world"]);
 }
 
-@test:Config
-function testGenerateStreamRejectsNonStringType() returns error? {
-    ModelProvider provider = check streamingProvider("text");
-    stream<int, ai:Error?>|ai:Error fragments = provider->generateStream(`Rate this out of 10`);
-    if fragments !is ai:Error {
-        test:assertFail("Expected generateStream to reject a non-string expected type");
-    }
-    test:assertTrue(fragments.message().includes("supports only 'string'"), fragments.message());
-}
-
 // The stream is closable part-way through, which is what an early `break` in a consumer does.
 @test:Config
 function testChatStreamCloseIsIdempotent() returns error? {
     ModelProvider provider = check streamingProvider("text");
-    stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-        check provider->chatStream({role: ai:USER, content: "hi"});
-    record {|ai:ChatCompletionChunk value;|}|ai:Error? first = chunks.next();
-    test:assertTrue(first is record {|ai:ChatCompletionChunk value;|});
+    stream<ai:ChatMessageChunk, ai:Error?> chunks =
+        check provider->chatAsStream({role: ai:USER, content: "hi"});
+    record {|ai:ChatMessageChunk value;|}|ai:Error? first = chunks.next();
+    test:assertTrue(first is record {|ai:ChatMessageChunk value;|});
     check chunks.close();
     check chunks.close();
 }

@@ -372,13 +372,13 @@ isolated function buildOpenRouterClient(string apiKey, string serviceUrl,
     return 'client;
 }
 
-# Builds the raw HTTP client backing `chatStream`.
+# Builds the raw HTTP client backing `chatAsStream` and `generateAsStream`.
 #
 # The generated OpenRouter connector deserializes the full response body, so a streaming
 # call cannot go through it and needs a plain `http:Client` instead. This mirrors
 # `buildOpenRouterClient` field for field, so a provider configured with a proxy, a custom
 # truststore, or tuned pool/retry/limit settings behaves the same whether the caller uses
-# `chat` or `chatStream`.
+# `chat` or `chatAsStream`.
 #
 # + apiKey - The OpenRouter API key
 # + serviceUrl - The base URL of the OpenRouter API endpoint

@@ -71,38 +71,37 @@ Sentiment|error result = openRouterModel->generate(
 
 ### Step 5: Stream the response
 
-To show the answer as it is produced rather than waiting for all of it, use `generateStream`
-for the generated text, or `chatStream` for the raw chunks:
+To show the answer as it is produced rather than waiting for all of it, use `generateAsStream`
+for the generated text, or `chatAsStream` for the raw chunks:
 
 ```ballerina
-stream<string, ai:Error?> fragments = check openRouterModel->generateStream(`Tell me about Ballerina`);
+stream<string, ai:Error?> fragments = check openRouterModel->generateAsStream(`Tell me about Ballerina`);
 check from string fragment in fragments
     do {
         io:print(fragment);
     };
 ```
 
-Each `ai:ChatCompletionChunk` from `chatStream` carries text, reasoning and tool-call fragments,
-and the last one carries the finish reason and the token usage. Tool-call fragments are
-correlated by `index`, so a caller accumulates the arguments of each call across chunks.
+Each `ai:ChatMessageChunk` from `chatAsStream` has `role` set to `ai:ASSISTANT` on every chunk,
+and carries text, reasoning and tool-call fragments, with the last chunk carrying the finish
+reason. Tool-call fragments are correlated by `index`, so a caller accumulates the arguments of
+each call across chunks.
 
-`generateStream` supports only `string`, since a partial generation is a valid value only for
-`string`; use `generate` for structured output. It also streams the answer text only - on a
-reasoning model the chain-of-thought that precedes the answer is dropped. To observe it, use
-`chatStream` and read `delta.reasoning`:
+`generateAsStream` streams the answer text only, since structured types have no valid
+intermediate state (use `generate` for structured output) - and on a reasoning model, the
+chain-of-thought that precedes the answer is dropped. To observe it, use `chatAsStream` and read
+`reasoning`:
 
 ```ballerina
 final ai:ModelProvider reasoner = check new openrouter:ModelProvider(
     "openRouterApiKey",
     modelType = "deepseek/deepseek-r1"
 );
-stream<ai:ChatCompletionChunk, ai:Error?> chunks =
-    check reasoner->chatStream({role: ai:USER, content: "What is 6 times 7?"});
-check from ai:ChatCompletionChunk chunk in chunks
+stream<ai:ChatMessageChunk, ai:Error?> chunks =
+    check reasoner->chatAsStream({role: ai:USER, content: "What is 6 times 7?"});
+check from ai:ChatMessageChunk chunk in chunks
     do {
-        foreach ai:ChatCompletionChunkChoice choice in chunk.choices {
-            io:print(choice.delta.reasoning ?: choice.delta.content ?: "");
-        }
+        io:print(chunk.reasoning ?: chunk.content ?: "");
     };
 ```
 
